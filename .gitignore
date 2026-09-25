@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Identifiants Google (depot public : ne jamais les committer)
+google-ads.yaml
+google-ads.yml
+application_default_credentials.json
+credentials*.json
+client_secret*.json
+token*.json
