@@ -45,12 +45,13 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from pydantic import TypeAdapter, ValidationError
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SERVICE_NAME = "lbc-google-ads-mcp"
 STARTED_AT = time.monotonic()
 
@@ -1560,6 +1561,277 @@ def _build_conversion_goal_ops(
     return ops, changes
 
 
+_BOOL_TEXT = {
+    "true": True, "1": True, "yes": True, "oui": True, "vrai": True,
+    "false": False, "0": False, "no": False, "non": False, "faux": False,
+}
+
+
+def _clean_bool(value: Any, label: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, str)) and str(value).strip().lower() in _BOOL_TEXT:
+        return _BOOL_TEXT[str(value).strip().lower()]
+    raise SpecError(f"{label} : booleen attendu (true/false), recu {value!r}.")
+
+
+def plan_customer_goal_changes(
+    requested: Any, current: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Valide les objectifs demandes contre les customer_conversion_goal existants.
+
+    `requested` : liste de {category, origin, biddable}. `current` : etat actuel
+    (dicts {category, origin, biddable}). Retourne (changements, etat apres) ;
+    un objectif deja a la valeur demandee n'est pas un changement. Leve
+    SpecError si l'entree est invalide ou vise un objectif inexistant.
+    """
+    if not isinstance(requested, list) or not requested:
+        raise SpecError(
+            "goals : liste non vide attendue, ex. "
+            '[{"category": "ADD_TO_CART", "origin": "WEBSITE", "biddable": false}].'
+        )
+    by_key = {(g["category"], g["origin"]): bool(g["biddable"]) for g in current}
+    wanted: dict[tuple[str, str], bool] = {}
+    for i, item in enumerate(requested):
+        label = f"goals[{i}]"
+        if not isinstance(item, dict):
+            raise SpecError(f"{label} : objet {{category, origin, biddable}} attendu.")
+        category = str(item.get("category") or "").strip().upper()
+        origin = str(item.get("origin") or "").strip().upper()
+        if not category or not origin:
+            raise SpecError(f"{label} : category et origin sont obligatoires.")
+        if "biddable" not in item:
+            raise SpecError(f"{label} : biddable est obligatoire (true ou false).")
+        biddable = _clean_bool(item["biddable"], f"{label}.biddable")
+        key = (category, origin)
+        if key not in by_key:
+            raise SpecError(
+                f"{label} : l'objectif {category} / {origin} n'existe pas dans le "
+                "compte. Objectifs existants : "
+                + ", ".join(f"{c}/{o}" for c, o in sorted(by_key))
+                + "."
+            )
+        if key in wanted and wanted[key] != biddable:
+            raise SpecError(f"{label} : {category} / {origin} demande deux fois avec des valeurs differentes.")
+        wanted[key] = biddable
+    changes = [
+        {"category": c, "origin": o, "biddable_before": by_key[(c, o)], "biddable_after": b}
+        for (c, o), b in wanted.items()
+        if by_key[(c, o)] != b
+    ]
+    after = [
+        {"category": g["category"], "origin": g["origin"],
+         "biddable": wanted.get((g["category"], g["origin"]), bool(g["biddable"]))}
+        for g in current
+    ]
+    after.sort(key=lambda g: (not g["biddable"], str(g["category"]), str(g["origin"])))
+    return changes, after
+
+
+def _build_customer_goal_ops(client, cid: str, changes: list[dict]) -> list:
+    """CustomerConversionGoalOperation (update de biddable) par changement."""
+    svc = client.get_service("CustomerConversionGoalService")
+    ops = []
+    for ch in changes:
+        op = client.get_type("CustomerConversionGoalOperation")
+        goal = op.update
+        goal.resource_name = svc.customer_conversion_goal_path(
+            cid, ch["category"], ch["origin"]
+        )
+        goal.biddable = bool(ch["biddable_after"])
+        # biddable=False est la valeur par defaut du proto : masque explicite.
+        op.update_mask.paths.append("biddable")
+        ops.append(op)
+    return ops
+
+
+def _app_required_goals(goal_type: Optional[str]) -> tuple[Optional[tuple[str, str]], str, bool]:
+    """Objectif du compte dont une campagne App qui suit le compte a besoin.
+
+    Retourne ((category, origin) precis, ou None = un objectif d'origine APP ;
+    libelle lisible ; True si DOWNLOAD/APP ne suffit pas (actions dans l'app)).
+    """
+    goal_type = str(goal_type or "")
+    if goal_type.startswith("OPTIMIZE_INSTALLS"):
+        return ("DOWNLOAD", "APP"), "DOWNLOAD/APP (installations)", False
+    if goal_type.startswith(("OPTIMIZE_IN_APP", "OPTIMIZE_RETURN_ON", "OPTIMIZE_TOTAL_VALUE")):
+        return None, "un objectif APP autre que DOWNLOAD/APP (actions dans l'application)", True
+    return None, "un objectif d'origine APP", False
+
+
+def analyze_app_campaigns(
+    app_campaigns: list[dict],
+    goal_levels: dict[str, str],
+    actions: dict[str, dict],
+    before: list[dict],
+    after: list[dict],
+    inheriting: list[dict],
+) -> tuple[list[dict], list[str], list[str]]:
+    """Impact d'un changement d'objectifs du compte sur les campagnes App.
+
+    Regle Google : une campagne App qui optimise sur des actions choisies
+    (selective_optimization) n'utilise pas les objectifs du compte ; changer
+    customer_conversion_goal ne lui retire rien. Elle n'en depend que si elle
+    est au niveau CUSTOMER (conversion_goal_campaign_config) ou n'a aucune
+    action choisie.
+
+    `app_campaigns` : lignes GAQL `campaign` (MULTI_CHANNEL) ; `goal_levels` :
+    {campaign_id: goal_config_level} (les campagnes App n'y figurent souvent
+    pas) ; `actions` : {resource_name: {name, category, origin}} des actions
+    choisies ; `before` / `after` : etats avant et apres
+    (plan_customer_goal_changes) ; `inheriting` : autres campagnes au niveau
+    CUSTOMER.
+
+    Alerte (bloquante en reel) seulement si le changement fait PERDRE a une
+    campagne App dependante l'objectif dont elle a besoin.
+    Retourne (resume par campagne, alertes bloquantes, avis informatifs).
+    """
+    def biddable_keys(state: list[dict]) -> set[tuple[str, str]]:
+        return {(g["category"], g["origin"]) for g in state if g["biddable"]}
+
+    before_biddable, after_biddable = biddable_keys(before), biddable_keys(after)
+    app_biddable_after = sorted(k for k in after_biddable if k[1] == "APP")
+
+    def satisfying(state: set, required, in_app_only: bool) -> set:
+        if required:
+            return {required} & state
+        return {k for k in state if k[1] == "APP" and not (in_app_only and k == ("DOWNLOAD", "APP"))}
+
+    summaries, warnings, notices = [], [], []
+    needed: set[tuple[str, str]] = set()
+    for c in app_campaigns:
+        camp_id = str(c.get("id"))
+        name = c.get("name")
+        level = goal_levels.get(camp_id)
+        goal_type = (c.get("app_campaign_setting") or {}).get("bidding_strategy_goal_type")
+        selected = (c.get("selective_optimization") or {}).get("conversion_actions") or []
+        used = [
+            dict(actions.get(rn, {"name": None, "category": None, "origin": None}), resource_name=rn)
+            for rn in selected
+        ]
+        depends = level == "CUSTOMER" or not selected
+        summary = {
+            "id": camp_id,
+            "name": name,
+            "status": c.get("status"),
+            "bidding_strategy": c.get("bidding_strategy_type"),
+            "app_goal": goal_type,
+            "goal_config_level": level,
+            "selective_optimization_actions": used,
+            "depends_on_account_goals": depends,
+        }
+        unresolved = [rn for rn in selected if rn not in actions]
+        if unresolved:
+            summary["unresolved_actions"] = unresolved
+        if depends:
+            required, label, in_app_only = _app_required_goals(goal_type)
+            ok_before = satisfying(before_biddable, required, in_app_only)
+            ok_after = satisfying(after_biddable, required, in_app_only)
+            needed |= ok_after
+            summary["note"] = (
+                "Cette campagne App SUIT les objectifs du compte "
+                + ("(niveau CUSTOMER)" if level == "CUSTOMER" else "(aucune action choisie en selective_optimization)")
+                + f" : elle a besoin de {label}. Objectifs APP biddable apres changement : "
+                + (", ".join(f"{k[0]}/{k[1]}" for k in app_biddable_after) or "AUCUN") + "."
+            )
+            notices.append(f"Campagne App {camp_id} ({name}) : elle depend des objectifs du compte ; elle a besoin de {label}.")
+            if ok_before and not ok_after:
+                warnings.append(
+                    f"Campagne App {camp_id} ({name}) : elle depend des objectifs du "
+                    f"compte et perdrait son objectif d'optimisation ({label} ne "
+                    "resterait pas biddable)."
+                )
+            elif not ok_after:
+                notices.append(
+                    f"Campagne App {camp_id} ({name}) : {label} n'est deja pas biddable "
+                    "au niveau du compte ; ce changement n'y change rien."
+                )
+        else:
+            summary["note"] = (
+                "Cette campagne App optimise sur ses propres actions de conversion "
+                "(selective_optimization) : les objectifs du compte ne s'appliquent "
+                "pas a elle, ce changement ne lui retire rien."
+            )
+            notices.append(
+                f"Campagne App {camp_id} ({name}) : independante des objectifs du compte "
+                "(selective_optimization : "
+                + (", ".join(str(u.get("name") or u["resource_name"]) for u in used)) + ")."
+            )
+        summaries.append(summary)
+    unneeded = [f"{k[0]}/{k[1]}" for k in app_biddable_after if k not in needed]
+    if unneeded and inheriting:
+        notices.append(
+            "Objectif(s) " + ", ".join(unneeded) + " encore biddable(s) : "
+            "aucune campagne App n'en a besoin, mais les campagnes au niveau "
+            "CUSTOMER (" + ", ".join(f"{i['id']} {i['name']}" for i in inheriting)
+            + ") continueraient d'encherir dessus. Les passer en secondaire, ou "
+            "donner a ces campagnes leurs propres objectifs "
+            "(set_campaign_conversion_goals)."
+        )
+    return summaries, warnings, notices
+
+
+SHARED_SET_NAME_MAX_LEN = 255
+
+
+def _shared_set_id(value: Any) -> str:
+    """'123' ou 'customers/X/sharedSets/123' -> '123'."""
+    text = str(value or "").strip()
+    m = re.fullmatch(r"(?:customers/\d+/sharedSets/)?(\d+)", text)
+    if not m:
+        raise SpecError(
+            f"shared_set invalide : {value!r}. Attendu : l'ID numerique de la liste "
+            "(retourne par create_brand_list) ou son resource name "
+            "customers/<cid>/sharedSets/<id>."
+        )
+    return m.group(1)
+
+
+def _clean_brand_entity_ids(values: Any) -> list[str]:
+    if not isinstance(values, list) or not values:
+        raise SpecError("brand_entity_ids : liste non vide d'ID de marque attendue (voir suggest_brands).")
+    ids: list[str] = []
+    for i, v in enumerate(values):
+        text = str(v or "").strip()
+        if not text:
+            raise SpecError(f"brand_entity_ids[{i}] : ID vide.")
+        if text not in ids:
+            ids.append(text)
+    return ids
+
+
+def _build_brand_list_ops(client, cid: str, name: str, entity_ids: list[str]) -> list:
+    """MutateOperation : un SharedSet BRANDS (ID temporaire -1) puis un
+    SharedCriterion (BrandInfo) par marque, a envoyer en une requete atomique."""
+    shared_set_rn = client.get_service("SharedSetService").shared_set_path(cid, "-1")
+    ops = []
+    op = client.get_type("MutateOperation")
+    shared_set = op.shared_set_operation.create
+    shared_set.resource_name = shared_set_rn
+    shared_set.name = name
+    shared_set.type_ = client.enums.SharedSetTypeEnum.BRANDS
+    ops.append(op)
+    for entity_id in entity_ids:
+        op = client.get_type("MutateOperation")
+        criterion = op.shared_criterion_operation.create
+        criterion.shared_set = shared_set_rn
+        criterion.brand.entity_id = entity_id
+        ops.append(op)
+    return ops
+
+
+def _build_brand_exclusion_op(client, cid: str, campaign_id: str, shared_set_rn: str):
+    """CampaignCriterionOperation : exclusion (negative) d'une liste de marques."""
+    op = client.get_type("CampaignCriterionOperation")
+    criterion = op.create
+    criterion.campaign = client.get_service("CampaignService").campaign_path(
+        cid, str(int(campaign_id))
+    )
+    criterion.negative = True
+    criterion.brand_list.shared_set = shared_set_rn
+    return op
+
+
 FINAL_URL_EXPANSION_SETTING = "FINAL_URL_EXPANSION_TEXT_ASSET_AUTOMATION"
 
 
@@ -2118,6 +2390,21 @@ class RoleAwareFastMCP(FastMCP):
             return None  # hors requete HTTP : aucun droit d'ecriture
         return (getattr(request, "scope", None) or {}).get(AUTH_SCOPE_KEY)
 
+    def effective_dry_run(self, name: str, arguments: Optional[dict]) -> bool:
+        """dry_run reellement applique : l'argument recu, sinon la valeur par
+        defaut de l'outil (true pour certains outils d'ecriture)."""
+        args = arguments or {}
+        if "dry_run" in args:
+            # Meme conversion que la validation pydantic de l'outil
+            # ("false", "0", "no" -> False).
+            try:
+                return TypeAdapter(bool).validate_python(args["dry_run"])
+            except ValidationError:
+                return False  # valeur invalide : l'appel lui-meme echouera
+        tool = self._tool_manager.get_tool(name)
+        props = ((tool.parameters or {}).get("properties") or {}) if tool else {}
+        return bool((props.get("dry_run") or {}).get("default", False))
+
     async def list_all_tools(self) -> list:
         """Tous les outils enregistres, sans filtre de role (tests, diagnostic)."""
         return await super().list_tools()
@@ -2140,7 +2427,7 @@ class RoleAwareFastMCP(FastMCP):
                     "(GOOGLE_ADS_ALLOW_WRITES)."
                 )
             )
-        dry = " (dry run)" if (arguments or {}).get("dry_run") else ""
+        dry = " (dry run)" if self.effective_dry_run(name, arguments) else ""
         log(f"[{name}]{dry} par {(user or {}).get('name', '?')}")
         return await super().call_tool(name, arguments)
 
@@ -2177,11 +2464,24 @@ mcp = RoleAwareFastMCP(
         "For anything not covered by a dedicated tool, use run_gaql with a "
         "Google Ads Query Language (GAQL) query. Performance Max campaigns: "
         "list_asset_groups (asset groups, search themes, audience signals). "
-        "Conversion goals: get_campaign_conversion_goals. Audiences / Customer "
+        "Conversion goals: get_campaign_conversion_goals (campaign vs account); "
+        "set_customer_conversion_goals changes account-level biddable goals and "
+        "lists the campaigns that inherit them. Brand exclusion for Performance "
+        "Max: suggest_brands -> create_brand_list -> set_pmax_brand_exclusion; "
+        "if the brand is not in Google's database, use campaign-level negative "
+        "keywords (add_negative_keywords works on Performance Max). "
+        "set_customer_conversion_goals, create_brand_list and "
+        "set_pmax_brand_exclusion default to dry_run=true; every other write "
+        "tool (including set_campaign_conversion_goals and add_negative_keywords) "
+        "applies the change immediately unless dry_run=true is passed. "
+        "Audiences / Customer "
         "Match: list_user_lists, get_customer_match_status (read). Write tools "
         "(set_campaign_status, set_campaign_budget, add_negative_keywords, "
         "set_campaign_target_roas, set_campaign_conversion_goals, "
+        "set_customer_conversion_goals, create_brand_list, "
+        "set_pmax_brand_exclusion, "
         "add_search_themes, set_campaign_url_expansion, create_search_campaign, "
+        "create_pmax_campaign, "
         "add_search_ad_group, add_campaign_assets, create_customer_match_list, "
         "upload_customer_match_members) modify a live advertising account that "
         "spends real money: always confirm with the user before calling them, "
@@ -2706,6 +3006,27 @@ def _conversion_goal_state(
     return campaign, config, goals
 
 
+def _customer_goals(cid: str) -> list[dict]:
+    """Objectifs de conversion du compte (customer_conversion_goal), tries."""
+    rows = run_query(
+        cid,
+        "SELECT customer_conversion_goal.category, "
+        "customer_conversion_goal.origin, customer_conversion_goal.biddable "
+        "FROM customer_conversion_goal",
+        limit=500,
+    )
+    goals = [
+        {
+            "category": g.get("category"),
+            "origin": g.get("origin"),
+            "biddable": bool(g.get("biddable", False)),
+        }
+        for g in (r.get("customer_conversion_goal", {}) for r in rows)
+    ]
+    goals.sort(key=lambda g: (not g["biddable"], str(g["category"]), str(g["origin"])))
+    return goals
+
+
 @read_tool
 def get_campaign_conversion_goals(
     campaign_id: str, customer_id: Optional[str] = None
@@ -2728,24 +3049,7 @@ def get_campaign_conversion_goals(
         if c is None:
             return fail(f"Campagne {campaign_id} introuvable dans le compte {cid}.")
 
-        account_rows = run_query(
-            cid,
-            "SELECT customer_conversion_goal.category, "
-            "customer_conversion_goal.origin, customer_conversion_goal.biddable "
-            "FROM customer_conversion_goal",
-            limit=500,
-        )
-        account_goals = [
-            {
-                "category": g.get("category"),
-                "origin": g.get("origin"),
-                "biddable": bool(g.get("biddable", False)),
-            }
-            for g in (r.get("customer_conversion_goal", {}) for r in account_rows)
-        ]
-        account_goals.sort(
-            key=lambda g: (not g["biddable"], str(g["category"]), str(g["origin"]))
-        )
+        account_goals = _customer_goals(cid)
         level = cfg.get("goal_config_level")
         return ok(
             {
@@ -2773,6 +3077,74 @@ def get_campaign_conversion_goals(
                 ),
             }
         )
+    except Exception as ex:
+        return format_google_ads_error(ex)
+
+
+@read_tool
+def suggest_brands(
+    prefix: str,
+    selected_brand_ids: Optional[list[str]] = None,
+    customer_id: Optional[str] = None,
+) -> str:
+    """Search Google's brand database (BrandSuggestionService.SuggestBrands).
+
+    Use it to find the brand entity IDs needed by create_brand_list (brand
+    exclusions for Performance Max). Returns each suggested brand's id, name,
+    URLs, state (ENABLED, UNVERIFIED, APPROVED, DEPRECATED, ...) and "usable"
+    (true for ENABLED and UNVERIFIED; an APPROVED id is superseded by the
+    ENABLED entry of the same brand). An empty
+    list means the brand is not in Google's database: exclude it with
+    campaign-level negative keywords instead (add_negative_keywords).
+
+    Args:
+        prefix: beginning of the brand name, e.g. "les belles combines".
+        selected_brand_ids: optional brand IDs to leave out of the results.
+        customer_id: optional 10-digit account ID; defaults to the server's account.
+    """
+    try:
+        prefix = str(prefix or "").strip()
+        if not prefix:
+            return fail("prefix est obligatoire (debut du nom de la marque).")
+        client = get_client()
+        cid = resolve_cid(customer_id)
+        request = client.get_type("SuggestBrandsRequest")
+        request.customer_id = cid
+        request.brand_prefix = prefix
+        for brand_id in selected_brand_ids or []:
+            if str(brand_id).strip():
+                request.selected_brands.append(str(brand_id).strip())
+        response = client.get_service("BrandSuggestionService").suggest_brands(
+            request=request
+        )
+        brands = [
+            {
+                "id": b.id,
+                "name": b.name,
+                "urls": list(b.urls),
+                "state": b.state.name,
+                "usable": b.state.name in ("ENABLED", "UNVERIFIED"),
+            }
+            for b in response.brands
+        ]
+        result: dict[str, Any] = {"prefix": prefix, "brand_count": len(brands), "brands": brands}
+        if not brands:
+            result["note"] = (
+                "Aucune marque trouvee dans la base de Google pour ce prefixe : "
+                "l'exclusion de marque n'est pas possible. Plan B : mots-cles "
+                "negatifs au niveau de la campagne (add_negative_keywords, PHRASE)."
+            )
+        else:
+            result["note"] = (
+                "Passer les id retenus (usable = true) a "
+                "create_brand_list(brand_entity_ids=...). Etats : ENABLED = marque "
+                "verifiee par Google, id a utiliser ; UNVERIFIED = marque propre a "
+                "ce compte (seul le compte qui l'a demandee peut l'utiliser) ; "
+                "APPROVED = ancien id remplace : relancer suggest_brands et prendre "
+                "l'entree ENABLED de la meme marque ; DEPRECATED, CANCELLED, "
+                "REJECTED = id invalide."
+            )
+        return ok(result)
     except Exception as ex:
         return format_google_ads_error(ex)
 
@@ -3329,6 +3701,442 @@ def set_campaign_conversion_goals(
             result.update(dry_run=True, valid=True)
         else:
             result.update(updated_goals=updated)
+        return ok(result)
+    except Exception as ex:
+        return format_google_ads_error(ex)
+
+
+@write_tool
+def set_customer_conversion_goals(
+    goals: list[dict],
+    dry_run: bool = True,
+    allow_app_goal_change: bool = False,
+    customer_id: Optional[str] = None,
+) -> str:
+    """Change which ACCOUNT-level conversion goals are biddable.
+    WRITE TOOL - confirm with the user first. dry_run defaults to TRUE.
+
+    Updates customer_conversion_goal.biddable for each (category, origin)
+    given; goals not listed are left as they are. A non-biddable goal stays
+    observed (secondary: reported in "All conversions", not used for bidding).
+    These goals apply to every campaign whose goal_config_level is CUSTOMER:
+    the result lists them. App campaigns are checked separately: one that
+    optimizes on its own selected actions (selective_optimization) does not
+    use account goals at all and is unaffected; one that follows the account
+    goals is flagged in "notices", and in "warnings" if it would lose the goal
+    it optimizes on (installs need DOWNLOAD/APP).
+
+    The result always shows before / after / changes / notices / warnings.
+    With dry_run=true the change is only validated by Google (validate_only).
+    A real change with warnings about an App campaign is refused unless
+    allow_app_goal_change=true.
+
+    Args:
+        goals: list of {"category", "origin", "biddable"}, e.g.
+            [{"category": "ADD_TO_CART", "origin": "WEBSITE", "biddable": false},
+             {"category": "PURCHASE", "origin": "WEBSITE", "biddable": true}].
+            Must match existing account goals (see get_campaign_conversion_goals,
+            account_goals).
+        dry_run: true (default) = validate and preview only, nothing applied.
+        allow_app_goal_change: true to apply even when an App campaign that
+            follows the account goals would lose its optimization goal.
+        customer_id: optional 10-digit account ID; defaults to the server's account.
+    """
+    try:
+        require_writes()
+        client = get_client()
+        cid = resolve_cid(customer_id)
+
+        before = _customer_goals(cid)
+        if not before:
+            return fail("Aucun objectif de conversion (customer_conversion_goal) dans ce compte.")
+        try:
+            changes, after = plan_customer_goal_changes(goals, before)
+        except SpecError as ex:
+            return fail(str(ex))
+
+        # Campagnes et niveau de leurs objectifs (CUSTOMER = herite du compte).
+        config_rows = run_query(
+            cid,
+            "SELECT campaign.id, campaign.name, campaign.status, "
+            "campaign.advertising_channel_type, campaign.bidding_strategy_type, "
+            "conversion_goal_campaign_config.goal_config_level "
+            "FROM conversion_goal_campaign_config WHERE campaign.status != 'REMOVED'",
+            limit=1000,
+        )
+        goal_levels: dict[str, str] = {}
+        inheriting, own_goals = [], []
+        for r in config_rows:
+            c = r.get("campaign", {})
+            level = r.get("conversion_goal_campaign_config", {}).get("goal_config_level")
+            goal_levels[str(c.get("id"))] = level
+            entry = {
+                "id": str(c.get("id")),
+                "name": c.get("name"),
+                "status": c.get("status"),
+                "channel_type": c.get("advertising_channel_type"),
+                "bidding_strategy": c.get("bidding_strategy_type"),
+            }
+            (inheriting if level == "CUSTOMER" else own_goals).append(entry)
+
+        # Campagnes App : objectif d'optimisation reel (selective_optimization).
+        app_rows = run_query(
+            cid,
+            "SELECT campaign.id, campaign.name, campaign.status, "
+            "campaign.bidding_strategy_type, "
+            "campaign.app_campaign_setting.bidding_strategy_goal_type, "
+            "campaign.selective_optimization.conversion_actions FROM campaign "
+            "WHERE campaign.advertising_channel_type = 'MULTI_CHANNEL' "
+            "AND campaign.status != 'REMOVED'",
+            limit=200,
+        )
+        app_campaigns = [r.get("campaign", {}) for r in app_rows]
+        action_rns = sorted(
+            {
+                rn
+                for c in app_campaigns
+                for rn in (c.get("selective_optimization") or {}).get("conversion_actions") or []
+            }
+        )
+        actions: dict[str, dict] = {}
+        if action_rns:
+            rn_list = ", ".join(f"'{rn}'" for rn in action_rns)
+            for r in run_query(
+                cid,
+                "SELECT conversion_action.resource_name, conversion_action.name, "
+                "conversion_action.category, conversion_action.origin "
+                f"FROM conversion_action WHERE conversion_action.resource_name IN ({rn_list})",
+                limit=len(action_rns),
+            ):
+                a = r.get("conversion_action", {})
+                actions[a.get("resource_name")] = {
+                    "name": a.get("name"),
+                    "category": a.get("category"),
+                    "origin": a.get("origin"),
+                }
+        non_app_inheriting = [i for i in inheriting if i["channel_type"] != "MULTI_CHANNEL"]
+        app_summary, app_warnings, notices = analyze_app_campaigns(
+            app_campaigns, goal_levels, actions, before, after, non_app_inheriting
+        )
+        # Campagne App sans ligne de config mais qui suit le compte (aucune
+        # action choisie) : elle fait partie des campagnes heritieres.
+        listed = {i["id"] for i in inheriting}
+        for a in app_summary:
+            if a["depends_on_account_goals"] and a["id"] not in listed:
+                own_goals = [o for o in own_goals if o["id"] != a["id"]]
+                inheriting.append(
+                    {"id": a["id"], "name": a["name"], "status": a["status"],
+                     "channel_type": "MULTI_CHANNEL", "bidding_strategy": a["bidding_strategy"]}
+                )
+
+        warnings = list(app_warnings)
+        if not any(g["biddable"] for g in after):
+            warnings.append(
+                "Aucun objectif du compte ne resterait biddable : les campagnes au "
+                "niveau CUSTOMER n'auraient plus rien a optimiser."
+            )
+        result: dict[str, Any] = {
+            "before_biddable": [f"{g['category']}/{g['origin']}" for g in before if g["biddable"]],
+            "after_biddable": [f"{g['category']}/{g['origin']}" for g in after if g["biddable"]],
+            "changes": changes,
+            "unchanged_requested": len(
+                {(str(g.get("category")).strip().upper(), str(g.get("origin")).strip().upper()) for g in goals}
+            ) - len(changes),
+            "after": after,
+            "campaigns_following_account_goals": inheriting,
+            "campaigns_with_own_goals": own_goals,
+            "app_campaigns": app_summary,
+            "notices": notices,
+            "warnings": warnings,
+            "note": (
+                "Seules les campagnes de campaigns_following_account_goals "
+                "(niveau CUSTOMER, plus les campagnes App sans action choisie) "
+                "sont touchees. Un objectif non "
+                "biddable reste mesure (colonne Toutes les conversions). Les "
+                "encheres intelligentes reapprennent pendant quelques jours."
+            ),
+        }
+        if not changes:
+            result.update(dry_run=bool(dry_run), valid=True, updated_goals=0,
+                          message="Aucun changement : les objectifs ont deja ces valeurs.")
+            return ok(result)
+        if app_warnings and not dry_run and not allow_app_goal_change:
+            return fail(
+                dict(
+                    result,
+                    message=(
+                        "Changement refuse : une campagne App qui suit les objectifs "
+                        "du compte perdrait son objectif d'optimisation (voir "
+                        "warnings). Garder l'objectif concerne biddable, ou relancer "
+                        "avec allow_app_goal_change=true si c'est voulu."
+                    ),
+                )
+            )
+
+        svc = client.get_service("CustomerConversionGoalService")
+        request = client.get_type("MutateCustomerConversionGoalsRequest")
+        request.customer_id = cid
+        for op in _build_customer_goal_ops(client, cid, changes):
+            request.operations.append(op)
+        request.validate_only = bool(dry_run)
+        from google.ads.googleads.errors import GoogleAdsException
+
+        try:
+            response = svc.mutate_customer_conversion_goals(request=request)
+        except GoogleAdsException as gex:
+            # Garder l'apercu et dire quel objectif Google refuse.
+            rejected = []
+            for err in gex.failure.errors:
+                goal = None
+                for el in err.location.field_path_elements:
+                    if el.field_name == "operations" and el._pb.HasField("index"):
+                        if el.index < len(changes):
+                            goal = f"{changes[el.index]['category']}/{changes[el.index]['origin']}"
+                rejected.append(
+                    {"goal": goal, "message": err.message, "code": str(err.error_code).strip()}
+                )
+            return fail(
+                dict(
+                    result,
+                    message="Google refuse le changement : rien n'a ete applique.",
+                    request_id=gex.request_id,
+                    rejected=rejected,
+                )
+            )
+        if dry_run:
+            result.update(dry_run=True, valid=True)
+        else:
+            result.update(updated_goals=len(response.results))
+        return ok(result)
+    except Exception as ex:
+        return format_google_ads_error(ex)
+
+
+def _brand_list_exclusions(cid: str, campaign_id: str) -> list[dict]:
+    """Listes de marques deja liees a une campagne (criteres BRAND_LIST)."""
+    rows = run_query(
+        cid,
+        "SELECT campaign_criterion.criterion_id, campaign_criterion.negative, "
+        "campaign_criterion.brand_list.shared_set FROM campaign_criterion "
+        f"WHERE campaign.id = {int(campaign_id)} "
+        "AND campaign_criterion.type = 'BRAND_LIST' "
+        "AND campaign_criterion.status != 'REMOVED'",
+        limit=100,
+    )
+    out = []
+    for r in rows:
+        crit = r.get("campaign_criterion", {})
+        out.append(
+            {
+                "criterion_id": str(crit.get("criterion_id")),
+                "negative": bool(crit.get("negative", False)),
+                "shared_set": (crit.get("brand_list") or {}).get("shared_set"),
+            }
+        )
+    return out
+
+
+@write_tool
+def create_brand_list(
+    name: str,
+    brand_entity_ids: list[str],
+    dry_run: bool = True,
+    customer_id: Optional[str] = None,
+) -> str:
+    """Create a brand list (shared set of type BRANDS) for brand exclusions.
+    WRITE TOOL - confirm with the user first. dry_run defaults to TRUE.
+
+    Creates one SharedSet (type BRANDS) and one SharedCriterion (BrandInfo)
+    per brand, in a single atomic request. Get brand IDs with suggest_brands.
+    The list does nothing until it is attached to a campaign with
+    set_pmax_brand_exclusion. Refuses a name already used by a brand list.
+
+    Args:
+        name: name of the list, e.g. "Marque - Les Belles Combines".
+        brand_entity_ids: brand IDs from suggest_brands (field "id").
+        dry_run: true (default) = validated by Google only, nothing created.
+        customer_id: optional 10-digit account ID; defaults to the server's account.
+    """
+    try:
+        require_writes()
+        name = str(name or "").strip()
+        if not name:
+            return fail("name est obligatoire.")
+        if len(name) > SHARED_SET_NAME_MAX_LEN:
+            return fail(f"name : {SHARED_SET_NAME_MAX_LEN} caracteres au maximum.")
+        try:
+            entity_ids = _clean_brand_entity_ids(brand_entity_ids)
+        except SpecError as ex:
+            return fail(str(ex))
+        client = get_client()
+        cid = resolve_cid(customer_id)
+
+        safe_name = name.replace("\\", "\\\\").replace("'", "\\'")
+        existing = run_query(
+            cid,
+            "SELECT shared_set.id, shared_set.name, shared_set.status FROM shared_set "
+            f"WHERE shared_set.type = 'BRANDS' AND shared_set.name = '{safe_name}' "
+            "AND shared_set.status = 'ENABLED'",
+            limit=1,
+        )
+        if existing:
+            s = existing[0].get("shared_set", {})
+            return fail(
+                {
+                    "message": "Une liste de marques porte deja ce nom.",
+                    "shared_set_id": str(s.get("id")),
+                    "hint": "Reutiliser cette liste avec set_pmax_brand_exclusion, ou choisir un autre nom.",
+                }
+            )
+
+        ops = _build_brand_list_ops(client, cid, name, entity_ids)
+        response = mutate_atomic(client, cid, ops, dry_run)
+        result: dict[str, Any] = {
+            "name": name,
+            "type": "BRANDS",
+            "brand_entity_ids": entity_ids,
+            "operations": count_ops(ops),
+        }
+        if dry_run:
+            result.update(dry_run=True, valid=True,
+                          next_step="Relancer avec dry_run=false, puis set_pmax_brand_exclusion.")
+        else:
+            created = created_resource_names(response)
+            shared_set_rn = (created.get("shared_set") or [None])[0]
+            result.update(
+                shared_set=shared_set_rn,
+                shared_set_id=shared_set_rn.rsplit("/", 1)[-1] if shared_set_rn else None,
+                brands_added=len(created.get("shared_criterion") or []),
+            )
+        return ok(result)
+    except Exception as ex:
+        return format_google_ads_error(ex)
+
+
+@write_tool
+def set_pmax_brand_exclusion(
+    campaign_id: str,
+    shared_set: str,
+    dry_run: bool = True,
+    customer_id: Optional[str] = None,
+) -> str:
+    """Exclude a brand list from a Performance Max campaign.
+    WRITE TOOL - confirm with the user first. dry_run defaults to TRUE.
+
+    Adds a negative CampaignCriterion with BrandListInfo pointing to the brand
+    list (SharedSet of type BRANDS, from create_brand_list). The PMax then
+    stops serving on Search and Shopping queries about those brands. Only
+    Performance Max campaigns are accepted; attaching the same list twice is
+    a no-op. Returns the campaign's brand-list exclusions before / after.
+
+    Args:
+        campaign_id: numeric ID of the Performance Max campaign.
+        shared_set: brand list ID (shared_set_id from create_brand_list) or
+            resource name customers/<cid>/sharedSets/<id>.
+        dry_run: true (default) = validated by Google only, nothing applied.
+        customer_id: optional 10-digit account ID; defaults to the server's account.
+    """
+    try:
+        require_writes()
+        try:
+            set_id = _shared_set_id(shared_set)
+        except SpecError as ex:
+            return fail(str(ex))
+        client = get_client()
+        cid = resolve_cid(customer_id)
+
+        row = campaign_row(
+            cid, campaign_id,
+            "campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type",
+        )
+        if row is None:
+            return fail(f"Campagne {campaign_id} introuvable dans le compte {cid}.")
+        c = row.get("campaign", {})
+        if c.get("advertising_channel_type") != "PERFORMANCE_MAX":
+            return fail(
+                {
+                    "message": "Cet outil ne vise que les campagnes Performance Max.",
+                    "campaign": c.get("name"),
+                    "channel_type": c.get("advertising_channel_type"),
+                }
+            )
+
+        set_rows = run_query(
+            cid,
+            "SELECT shared_set.id, shared_set.name, shared_set.type, shared_set.status, "
+            f"shared_set.member_count FROM shared_set WHERE shared_set.id = {int(set_id)}",
+            limit=1,
+        )
+        if not set_rows:
+            return fail(f"Liste partagee {set_id} introuvable dans le compte {cid}.")
+        s = set_rows[0].get("shared_set", {})
+        # MessageToDict garde le nom de champ proto-plus "type_".
+        set_type = s.get("type_", s.get("type"))
+        if set_type != "BRANDS" or s.get("status") != "ENABLED":
+            return fail(
+                {
+                    "message": "La liste doit etre une liste de marques (type BRANDS) active.",
+                    "shared_set": s,
+                }
+            )
+        shared_set_rn = client.get_service("SharedSetService").shared_set_path(cid, set_id)
+        member_rows = run_query(
+            cid,
+            "SELECT shared_criterion.brand.entity_id, shared_criterion.brand.display_name, "
+            "shared_criterion.brand.status FROM shared_criterion "
+            f"WHERE shared_set.id = {int(set_id)}",
+            limit=1000,
+        )
+        brands = [
+            {
+                "entity_id": b.get("entity_id"),
+                "display_name": b.get("display_name"),
+                "status": b.get("status"),
+            }
+            for b in ((r.get("shared_criterion") or {}).get("brand") or {} for r in member_rows)
+        ]
+
+        before = _brand_list_exclusions(cid, campaign_id)
+        result: dict[str, Any] = {
+            "campaign": c.get("name"),
+            "campaign_id": str(c.get("id")),
+            "brand_list": {
+                "id": set_id,
+                "name": s.get("name"),
+                "member_count": s.get("member_count"),
+                "brands": brands,
+            },
+            "brand_lists_before": before,
+        }
+        if any(b["shared_set"] == shared_set_rn and b["negative"] for b in before):
+            result.update(
+                dry_run=bool(dry_run), valid=True, already_attached=True,
+                brand_lists_after=before,
+                message="Cette liste est deja liee a la campagne : rien a faire.",
+            )
+            return ok(result)
+
+        svc = client.get_service("CampaignCriterionService")
+        request = client.get_type("MutateCampaignCriteriaRequest")
+        request.customer_id = cid
+        request.operations.append(
+            _build_brand_exclusion_op(client, cid, campaign_id, shared_set_rn)
+        )
+        request.validate_only = bool(dry_run)
+        response = svc.mutate_campaign_criteria(request=request)
+        result["brand_lists_after"] = before + [
+            {"criterion_id": None if dry_run else response.results[0].resource_name.rsplit("~", 1)[-1],
+             "negative": True, "shared_set": shared_set_rn}
+        ]
+        result["note"] = (
+            "Mesurer apres 4 semaines : valeur de conversion de la PMax hors "
+            "requetes de marque, cout de la campagne Recherche de marque, ventes "
+            "nettes totales."
+        )
+        if dry_run:
+            result.update(dry_run=True, valid=True)
+        else:
+            result.update(added=response.results[0].resource_name)
         return ok(result)
     except Exception as ex:
         return format_google_ads_error(ex)

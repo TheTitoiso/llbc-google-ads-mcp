@@ -12,7 +12,7 @@ connecteur claude.ai, et verifie :
      aucun secret ni ID de compte dans la reponse ;
   2. les refus 401 (secret inconnu, trop court, absent, mauvais chemin) ;
   3. initialize : nom, version et instructions (marque, compte par defaut) ;
-  4. tools/list selon le role : cle full = 23 outils, cle read = 10 outils de
+  4. tools/list selon le role : cle full = 27 outils, cle read = 11 outils de
      lecture (chemin /mcp/<secret> et en-tete Authorization: Bearer) ;
   5. tools/call : outil d'ecriture refuse a une cle read, compte par defaut,
      compte servi explicite, compte non servi refuse ;
@@ -101,7 +101,7 @@ async def run() -> None:
             check(health["version"] == main.VERSION and health["writes_enabled"] is True, f"version : {health}")
             check(health["auth_keys"] == {"full": 1, "read": 1}, f"cle trop courte ignoree : {health['auth_keys']}")
             check(health["google_ads_configured"] is False and health["default_customer_configured"] is True, f"config : {health}")
-            check(len(health["tools"]["read"]) == 10 and len(health["tools"]["write"]) == 13, f"outils : {health['tools']}")
+            check(len(health["tools"]["read"]) == 11 and len(health["tools"]["write"]) == 16, f"outils : {health['tools']}")
             check(all(s not in r.text for s in (FULL_KEY, READ_KEY, CID, OTHER_CID)), "ni secret ni compte dans /health")
             check((await http.get("/")).json()["service"] == "lbc-google-ads-mcp", "/ = /health")
 
@@ -137,8 +137,8 @@ async def run() -> None:
             full_tools = await list_tools(f"/mcp/{FULL_KEY}")
             full = sorted(t["name"] for t in full_tools)
             read = await tool_names(f"/mcp/{READ_KEY}")
-            check(len(full) == 23 and set(full) == main.READ_TOOL_NAMES | main.WRITE_TOOL_NAMES, f"cle full : {full}")
-            check(read == sorted(main.READ_TOOL_NAMES) and len(read) == 10, f"cle read : {read}")
+            check(len(full) == 27 and set(full) == main.READ_TOOL_NAMES | main.WRITE_TOOL_NAMES, f"cle full : {full}")
+            check(read == sorted(main.READ_TOOL_NAMES) and len(read) == 11, f"cle read : {read}")
             check(await tool_names("/mcp", {"Authorization": f"Bearer {READ_KEY}"}) == read, "Bearer, cle read")
             check(await tool_names("/mcp", {"Authorization": f"bearer {FULL_KEY}"}) == full, "Bearer, cle full")
             check(await tool_names(f"/mcp/{FULL_KEY}/") == full, "barre finale toleree")

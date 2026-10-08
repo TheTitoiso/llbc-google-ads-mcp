@@ -3,7 +3,8 @@
 Ce serveur expose le compte Google Ads des Belles Combines à Claude via un serveur MCP (Model Context Protocol) hébergé sur Railway. Une fois connecté, Claude peut analyser les campagnes, les mots-clés et les termes de recherche. Si l'écriture est activée et la clé d'accès le permet, il peut aussi :
 
 - mettre des campagnes en pause, ajuster des budgets et ajouter des mots-clés négatifs ;
-- régler les objectifs de conversion et le ROAS cible ;
+- régler les objectifs de conversion (d'une campagne ou du compte) et le ROAS cible ;
+- exclure la marque d'une campagne Performance Max (liste de marques Google, ou mots-clés négatifs) ;
 - enrichir une campagne Performance Max (thèmes de recherche, expansion d'URL) ;
 - créer des campagnes Search ou Performance Max complètes ;
 - bâtir des audiences Customer Match.
@@ -14,7 +15,7 @@ Claude (claude.ai) ──HTTPS──► Railway (ce serveur) ──API──► 
 
 ## D'où vient ce serveur
 
-- **Base** : le serveur Google Ads de Snoc ([`Snoc-Studio/snoc-google-ads-mcp`](https://github.com/Snoc-Studio/snoc-google-ads-mcp)). Il apporte les mêmes 23 outils, les mêmes validations avant l'appel à Google et les mêmes tests hors ligne.
+- **Base** : le serveur Google Ads de Snoc ([`Snoc-Studio/snoc-google-ads-mcp`](https://github.com/Snoc-Studio/snoc-google-ads-mcp)). Il apporte 23 outils (27 avec les ajouts LBC), les mêmes validations avant l'appel à Google et les mêmes tests hors ligne.
 - **Conventions LBC** : elles viennent du serveur Meta Ads des Belles Combines (`TheTitoiso/lbc-meta-ads-cloud`). Chaque personne a sa propre clé d'accès avec un rôle, la marque et le compte sont décrits par les variables d'environnement, rien n'est en dur dans le code, et `/health` indique la marque et la version.
 
 | | Serveur Snoc | Ce serveur (LBC) |
@@ -84,7 +85,7 @@ Le fichier gcloud se trouve dans `~/.config/gcloud/` sur Mac. Si le serveur loca
 3. Le domaine public se crée dans **Settings → Networking → Generate Domain** et donne une URL du type `https://xxxx.up.railway.app`.
 4. Pour vérifier, ouvrir `https://<domaine>/health` :
    ```json
-   {"status": "ok", "service": "lbc-google-ads-mcp", "brand": "Les Belles Combines", "version": "1.0.0",
+   {"status": "ok", "service": "lbc-google-ads-mcp", "brand": "Les Belles Combines", "version": "1.1.0",
     "writes_enabled": true, "google_ads_configured": true, "default_customer_configured": true,
     "auth_keys": {"full": 1, "read": 0}, "tools": {"read": ["…"], "write": ["…"]}, "uptime_s": 42}
    ```
@@ -97,7 +98,7 @@ Le fichier gcloud se trouve dans `~/.config/gcloud/` sur Mac. Si le serveur loca
 
 Les clients qui gèrent les en-têtes (Claude Code, API) peuvent aussi utiliser `https://<domaine>/mcp` avec l'en-tête `Authorization: Bearer <secret>`.
 
-**Une clé par personne** : par exemple `secret1:thierry:full,secret2:agence:read`. Une clé `read` ne voit que les 10 outils de lecture. Pour révoquer une clé, il suffit de la retirer de `AUTH_KEYS` et de redéployer.
+**Une clé par personne** : par exemple `secret1:thierry:full,secret2:agence:read`. Une clé `read` ne voit que les 11 outils de lecture. Pour révoquer une clé, il suffit de la retirer de `AUTH_KEYS` et de redéployer.
 
 ## Outils exposés à Claude
 
@@ -115,6 +116,7 @@ Les clients qui gèrent les en-têtes (Claude Code, API) peuvent aussi utiliser 
 | `get_search_terms` | Termes de recherche réels (chasse au gaspillage) |
 | `list_asset_groups` | Groupes d'assets d'une campagne Performance Max, avec thèmes de recherche et signaux d'audience |
 | `get_campaign_conversion_goals` | Objectifs de conversion d'une campagne comparés à ceux du compte |
+| `suggest_brands` | Recherche une marque dans la base de Google (id, nom, URL, état, `usable`), pour les exclusions de marque |
 | `list_user_lists` | Listes d'audience (Customer Match, remarketing…) : tailles, éligibilité, taux de correspondance |
 | `get_customer_match_status` | État d'une liste Customer Match et/ou d'un job d'import |
 
@@ -127,6 +129,9 @@ Les clients qui gèrent les en-têtes (Claude Code, API) peuvent aussi utiliser 
 | `add_negative_keywords` | Ajouter des mots-clés négatifs à une campagne |
 | `set_campaign_target_roas` | Fixer ou retirer le ROAS cible (ratio : 3.0 = 300 %) |
 | `set_campaign_conversion_goals` | Objectifs de conversion propres à la campagne, catégories « biddable » (ex. `PURCHASE` seulement) |
+| `set_customer_conversion_goals` | Objectifs biddable **du compte** (`category`, `origin`, `biddable`) ; liste les campagnes qui en héritent et vérifie les campagnes App. `dry_run=true` par défaut |
+| `create_brand_list` | Liste de marques (SharedSet `BRANDS` + un critère par marque), en une requête atomique. `dry_run=true` par défaut |
+| `set_pmax_brand_exclusion` | Exclut une liste de marques d'une campagne Performance Max (critère négatif `BrandListInfo`). `dry_run=true` par défaut |
 | `add_search_themes` | Ajouter des thèmes de recherche à un groupe d'assets Performance Max (25 au maximum, doublons ignorés) |
 | `set_campaign_url_expansion` | Activer ou désactiver l'expansion d'URL finale (Performance Max) |
 | `create_search_campaign` | Campagne Search complète en une requête atomique (budget, ciblage, groupes d'annonces, annonces responsives, mots-clés, sitelinks, callouts), créée en pause par défaut |
@@ -137,6 +142,25 @@ Les clients qui gèrent les en-têtes (Claude Code, API) peuvent aussi utiliser 
 | `upload_customer_match_members` | Ajouter ou retirer des membres à partir de coordonnées brutes, normalisées et hachées en SHA-256 sur le serveur |
 
 Les montants `*_micros` de l'API sont des millionièmes de la devise du compte ; les outils renvoient aussi les montants convertis. Pour `create_search_campaign` et `create_pmax_campaign`, demander à Claude de montrer la spécification et de lancer un `dry_run` avant la création réelle. Les limites de Google (longueur des titres et descriptions, nombre d'assets…) sont vérifiées avant l'appel à l'API.
+
+**Objectifs de conversion du compte** : `set_customer_conversion_goals` ne touche que les objectifs cités ; un objectif non biddable reste mesuré (colonne « Toutes les conversions »). Le résultat donne l'avant/après, les campagnes au niveau `CUSTOMER` (qui héritent des objectifs du compte) et celles qui ont leurs propres objectifs, plus des `notices` (informations) et des `warnings` (alertes). Les campagnes App sont vérifiées à part :
+
+- une campagne App qui optimise sur ses propres actions (`selective_optimization`) n'utilise pas les objectifs du compte : le changement ne lui retire rien, l'outil l'indique dans `notices` ;
+- une campagne App au niveau `CUSTOMER`, ou sans action choisie, suit les objectifs du compte : l'outil le signale dans `notices`, et dans `warnings` si elle perdrait l'objectif dont elle a besoin (`DOWNLOAD/APP` pour une campagne d'installations). Le changement réel est alors refusé sans `allow_app_goal_change=true` ;
+- si un objectif `APP` reste biddable sans qu'aucune campagne App en ait besoin, `notices` rappelle que les campagnes au niveau `CUSTOMER` (Recherche, Vidéo…) continueront d'enchérir dessus.
+
+Si Google refuse un des objectifs, rien n'est appliqué, mais la réponse garde l'aperçu et nomme l'objectif refusé.
+
+**Exclusion de marque (Performance Max)** : `suggest_brands("les belles combines")` → `create_brand_list(name, brand_entity_ids)` → `set_pmax_brand_exclusion(campaign_id, shared_set)`. Si la marque n'est pas dans la base de Google (`suggest_brands` renvoie une liste vide), on passe par des mots-clés négatifs au niveau de la campagne, que `add_negative_keywords` accepte sur une Performance Max (vérifié en `validate_only` sur la PMax du compte). En `PHRASE`, « belles combines » couvre déjà « les belles combines » et « octave belles combines » ; en `EXACT`, seules les requêtes identiques sont exclues :
+
+```
+add_negative_keywords(campaign_id="<id de la PMax>", match_type="PHRASE",
+    keywords=["les belles combines", "belles combines", "octave belles combines"], dry_run=true)
+add_negative_keywords(campaign_id="<id de la PMax>", match_type="EXACT",
+    keywords=["les belles combines", "belles combines", "octave belles combines"], dry_run=true)
+```
+
+Les variantes proches (« les belle combine », « belle combine ») ne sont pas couvertes par un négatif EXACT ni PHRASE : les ajouter explicitement si elles apparaissent dans `get_search_terms` de la PMax.
 
 **Customer Match** : les coordonnées transitent par le serveur le temps d'être normalisées et hachées en mémoire. Seules les empreintes (plus le pays et le code postal) partent chez Google ; rien n'est journalisé ni stocké. Le consentement est déclaré `GRANTED` : n'importer que des clients qui ont consenti. Google traite l'import en 6 à 48 h.
 
@@ -168,7 +192,7 @@ Les tests se lancent sans identifiants et sans aucune requête réseau :
 
 ```bash
 pip install -r requirements.txt
-python tests/offline_build_test.py   # outils, opérations Google Ads (API v22 et version par défaut), Customer Match, clés, comptes servis
+python tests/offline_build_test.py   # outils, opérations Google Ads (API v22 et version par défaut), objectifs du compte, marques, Customer Match, clés, comptes servis
 python tests/http_auth_test.py       # couche HTTP : /health, 401, rôles full / read, Bearer, compte par défaut
 ```
 
