@@ -31,6 +31,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 from types import SimpleNamespace
 
@@ -545,6 +546,190 @@ def test_conversion_goal_ops(client) -> None:
         getattr(client.enums.ConversionActionCategoryEnum, name)
 
 
+# Etat representatif d'un compte (valeurs fictives) : objectifs du compte,
+# campagne App d'installations avec ses propres actions (selective_optimization).
+APP_ID = "1000000001"
+ACCOUNT_GOALS = [
+    {"category": c, "origin": o, "biddable": b}
+    for c, o, b in [
+        ("ADD_TO_CART", "WEBSITE", True), ("BEGIN_CHECKOUT", "WEBSITE", True),
+        ("CONTACT", "WEBSITE", True), ("DEFAULT", "WEBSITE", True),
+        ("DOWNLOAD", "APP", True), ("SUBSCRIBE_PAID", "APP", True),
+        ("ENGAGEMENT", "YOUTUBE_HOSTED", True), ("YOUTUBE_FOLLOW_ON_VIEWS", "YOUTUBE_HOSTED", True),
+        ("PHONE_CALL_LEAD", "CALL_FROM_ADS", True), ("PURCHASE", "WEBSITE", True),
+        ("PAGE_VIEW", "WEBSITE", False), ("CONTACT", "GOOGLE_HOSTED", False),
+    ]
+]
+# Plan d'utilisation, etape 1 : PURCHASE/WEBSITE seul biddable. La campagne
+# App optimise sur ses propres actions : elle n'a besoin d'aucun objectif du compte.
+PLAN_GOALS = [
+    {"category": g["category"], "origin": g["origin"],
+     "biddable": (g["category"], g["origin"]) == ("PURCHASE", "WEBSITE")}
+    for g in ACCOUNT_GOALS
+]
+APP_ACTION_RN = f"customers/{CID}/conversionActions/2000000001"
+APP_CAMPAIGN = {
+    "id": APP_ID, "name": "App - installations", "status": "ENABLED",
+    "bidding_strategy_type": "TARGET_CPA",
+    "app_campaign_setting": {"bidding_strategy_goal_type": "OPTIMIZE_INSTALLS_TARGET_INSTALL_COST"},
+    "selective_optimization": {"conversion_actions": [APP_ACTION_RN]},
+}
+APP_ACTIONS = {APP_ACTION_RN: {"name": "Installations Android", "category": "DOWNLOAD", "origin": "APP"}}
+INHERITING = [{"id": "1000000003", "name": "Recherche - marque", "status": "ENABLED",
+               "channel_type": "SEARCH", "bidding_strategy": "MAXIMIZE_CONVERSION_VALUE"}]
+
+
+def test_customer_goal_ops(client) -> None:
+    changes, after = main.plan_customer_goal_changes(PLAN_GOALS, ACCOUNT_GOALS)
+    check(len(changes) == 9, f"9 objectifs passent en secondaire : {changes}")
+    check(all(c["biddable_before"] and not c["biddable_after"] for c in changes), "sens des changements")
+    check([f"{g['category']}/{g['origin']}" for g in after if g["biddable"]] == ["PURCHASE/WEBSITE"], "etat apres")
+    check(len(after) == len(ACCOUNT_GOALS), "objectifs non cites conserves")
+    # Entree souple : minuscules, booleens texte ; doublon identique accepte.
+    changes2, _ = main.plan_customer_goal_changes(
+        [{"category": " add_to_cart ", "origin": " website ", "biddable": "false"},
+         {"category": "ADD_TO_CART", "origin": "WEBSITE", "biddable": False},
+         {"category": "PURCHASE", "origin": "WEBSITE", "biddable": True}],
+        ACCOUNT_GOALS,
+    )
+    check(changes2 == [{"category": "ADD_TO_CART", "origin": "WEBSITE", "biddable_before": True, "biddable_after": False}], f"entree souple : {changes2}")
+
+    def expect_error(goals, fragment: str) -> None:
+        try:
+            main.plan_customer_goal_changes(goals, ACCOUNT_GOALS)
+        except main.SpecError as ex:
+            check(fragment in str(ex), f"message attendu {fragment!r} : {ex}")
+            return
+        raise AssertionError(f"erreur attendue ({fragment}) pour {goals}")
+
+    expect_error([], "liste non vide")
+    expect_error([{"category": "PURCHASE", "origin": "APP", "biddable": True}], "n'existe pas")
+    expect_error([{"category": "PURCHASE", "biddable": True}], "obligatoires")
+    expect_error([{"category": "PURCHASE", "origin": "WEBSITE"}], "biddable est obligatoire")
+    expect_error([{"category": "PURCHASE", "origin": "WEBSITE", "biddable": "peut-etre"}], "booleen")
+    expect_error([{"category": "PURCHASE", "origin": "WEBSITE", "biddable": True},
+                  {"category": "PURCHASE", "origin": "WEBSITE", "biddable": False}], "deux fois")
+
+    ops = main._build_customer_goal_ops(client, CID, changes)
+    check(len(ops) == 9, "une operation par changement")
+    op = ops[0]
+    check(op.update.resource_name == f"customers/{CID}/customerConversionGoals/{changes[0]['category']}~{changes[0]['origin']}", f"resource name : {op.update.resource_name}")
+    check(op.update.biddable is False and list(op.update_mask.paths) == ["biddable"], "biddable False + masque explicite")
+    request = client.get_type("MutateCustomerConversionGoalsRequest")
+    request.customer_id = CID
+    request.operations.extend(ops)
+    request.validate_only = True
+    check(len(request.operations) == 9, "requete objectifs du compte")
+
+    # Retour arriere : secondaire -> biddable ("true" en texte compris).
+    back, back_after = main.plan_customer_goal_changes(
+        [{"category": "PAGE_VIEW", "origin": "WEBSITE", "biddable": "true"},
+         {"category": "CONTACT", "origin": "GOOGLE_HOSTED", "biddable": True},
+         {"category": "ADD_TO_CART", "origin": "WEBSITE", "biddable": False}],
+        ACCOUNT_GOALS,
+    )
+    check([(c["category"], c["biddable_after"]) for c in back] == [("PAGE_VIEW", True), ("CONTACT", True), ("ADD_TO_CART", False)], f"retour arriere : {back}")
+    back_ops = main._build_customer_goal_ops(client, CID, back)
+    check([o.update.biddable for o in back_ops] == [True, True, False], "valeurs envoyees True/True/False")
+    check(all(list(o.update_mask.paths) == ["biddable"] for o in back_ops), "masque biddable partout")
+    check(("PAGE_VIEW", "WEBSITE", True) in {(g["category"], g["origin"], g["biddable"]) for g in back_after}, "etat apres True")
+
+    def analyze(campaign, levels, after_state, actions=APP_ACTIONS, inheriting=INHERITING, before=ACCOUNT_GOALS):
+        return main.analyze_app_campaigns([campaign], levels, actions, before, after_state, inheriting)
+
+    def plan(goals, current=ACCOUNT_GOALS):
+        return main.plan_customer_goal_changes(goals, current)[1]
+
+    # 1) Campagne App avec ses propres actions : independante, aucune alerte,
+    #    meme si DOWNLOAD/APP passe en secondaire au niveau du compte.
+    summary, warnings, notices = analyze(APP_CAMPAIGN, {}, after)
+    check(warnings == [] and summary[0]["depends_on_account_goals"] is False, f"App independante : {summary} {warnings}")
+    check(summary[0]["selective_optimization_actions"][0]["category"] == "DOWNLOAD", "action App resolue")
+    check(len(notices) == 1 and "independante" in notices[0] and "Installations Android" in notices[0], f"avis App : {notices}")
+    check("ne lui retire rien" in summary[0]["note"] and "SUIT" not in summary[0]["note"], f"note independante : {summary[0]['note']}")
+    # 2) DOWNLOAD/APP garde biddable sans campagne App qui en ait besoin :
+    #    avis sur les campagnes au niveau CUSTOMER qui continueraient d'encherir dessus.
+    keep_after = plan([dict(g, biddable=(g["category"], g["origin"]) in {("PURCHASE", "WEBSITE"), ("DOWNLOAD", "APP")}) for g in ACCOUNT_GOALS])
+    _, warnings, notices = analyze(APP_CAMPAIGN, {}, keep_after)
+    check(warnings == [] and any("DOWNLOAD/APP" in n and "aucune campagne App" in n and "1000000003" in n for n in notices), f"avis objectif APP inutile : {notices}")
+    _, warnings, notices = analyze(APP_CAMPAIGN, {}, keep_after, inheriting=[])
+    check(warnings == [] and not any("aucune campagne App" in n for n in notices), f"pas d'avis sans campagne CUSTOMER : {notices}")
+    # 3) Campagne App au niveau CUSTOMER (meme avec des actions choisies) :
+    #    dependante ; DOWNLOAD/APP seul coupe = alerte, meme si SUBSCRIBE_PAID/APP reste.
+    dl_after = plan([{"category": "DOWNLOAD", "origin": "APP", "biddable": False}])
+    summary, warnings, notices = analyze(APP_CAMPAIGN, {APP_ID: "CUSTOMER"}, dl_after)
+    check(summary[0]["depends_on_account_goals"] is True, "niveau CUSTOMER = dependante")
+    check(len(warnings) == 1 and "DOWNLOAD/APP" in warnings[0], f"alerte installations (CUSTOMER) : {warnings}")
+    check(any("depend des objectifs du compte" in n for n in notices), "dependance signalee dans notices")
+    check("SUIT" in summary[0]["note"] and "CUSTOMER" in summary[0]["note"] and "retire rien" not in summary[0]["note"], f"note CUSTOMER : {summary[0]['note']}")
+    # SUBSCRIBE_PAID/APP reste biddable sans qu'une App d'installations en ait besoin : avis par objectif.
+    check(any("SUBSCRIBE_PAID/APP" in n and "aucune campagne App" in n for n in notices), f"avis par objectif : {notices}")
+    check(not any("DOWNLOAD/APP" in n and "aucune campagne App" in n for n in notices), "pas d'avis sur l'objectif utile")
+    no_tic = dict(APP_CAMPAIGN, app_campaign_setting={"bidding_strategy_goal_type": "OPTIMIZE_INSTALLS_WITHOUT_TARGET_INSTALL_COST"})
+    _, warnings, _ = analyze(no_tic, {APP_ID: "CUSTOMER"}, dl_after)
+    check(len(warnings) == 1 and "DOWNLOAD/APP" in warnings[0], f"alerte installations sans CPI cible : {warnings}")
+    # 4) Sans ligne de config et sans action choisie : dependante aussi.
+    no_selection = dict(APP_CAMPAIGN, selective_optimization={})
+    summary, warnings, _ = analyze(no_selection, {}, dl_after, actions={})
+    check(summary[0]["depends_on_account_goals"] is True and len(warnings) == 1, f"sans action choisie : {warnings}")
+    check("SUIT" in summary[0]["note"] and "aucune action choisie" in summary[0]["note"], f"note sans action : {summary[0]['note']}")
+    # Dependante mais DOWNLOAD/APP garde : aucune alerte, pas d'avis "inutile".
+    summary, warnings, notices = analyze(no_selection, {}, keep_after, actions={})
+    check(warnings == [] and summary[0]["depends_on_account_goals"] is True, "dependante, objectif garde")
+    check(not any("aucune campagne App" in n for n in notices), f"objectif APP utile : pas d'avis 'inutile' : {notices}")
+    # Installations garde + SUBSCRIBE_PAID/APP biddable : avis sur SUBSCRIBE_PAID seulement.
+    _, warnings, notices = analyze(no_selection, {}, plan([{"category": "ADD_TO_CART", "origin": "WEBSITE", "biddable": False}]), actions={})
+    unneeded = [n for n in notices if "aucune campagne App" in n]
+    check(warnings == [] and len(unneeded) == 1 and "SUBSCRIBE_PAID/APP" in unneeded[0] and "DOWNLOAD/APP" not in unneeded[0], f"avis par objectif (dependante) : {notices}")
+    # Objectif deja secondaire avant le changement : pas une perte, pas de blocage.
+    dl_off = [dict(g, biddable=False) if (g["category"], g["origin"]) == ("DOWNLOAD", "APP") else g for g in ACCOUNT_GOALS]
+    unrelated_after = plan([{"category": "ADD_TO_CART", "origin": "WEBSITE", "biddable": False}], dl_off)
+    _, warnings, notices = analyze(no_selection, {}, unrelated_after, actions={}, before=dl_off)
+    check(warnings == [] and any("deja pas biddable" in n for n in notices), f"objectif deja secondaire : {warnings} {notices}")
+    # 5) Campagne App d'actions dans l'application : un objectif APP autre que DOWNLOAD.
+    in_app = dict(no_selection, app_campaign_setting={"bidding_strategy_goal_type": "OPTIMIZE_IN_APP_CONVERSIONS_TARGET_CONVERSION_COST"})
+    _, warnings, _ = analyze(in_app, {}, dl_after, actions={})
+    check(warnings == [], f"in-app : SUBSCRIBE_PAID/APP suffit : {warnings}")
+    sub_off_after = plan([{"category": "SUBSCRIBE_PAID", "origin": "APP", "biddable": False}])
+    _, warnings, _ = analyze(in_app, {}, sub_off_after, actions={})
+    check(len(warnings) == 1 and "autre que DOWNLOAD" in warnings[0], f"in-app : DOWNLOAD/APP seul ne suffit pas : {warnings}")
+    # 6) Action choisie introuvable : signalee, campagne toujours independante.
+    summary, warnings, _ = analyze(APP_CAMPAIGN, {}, after, actions={})
+    check(summary[0]["unresolved_actions"] == [APP_ACTION_RN] and warnings == [], "action non resolue signalee")
+
+
+def test_brand_ops(client) -> None:
+    ops = main._build_brand_list_ops(client, CID, "Marque - LBC", ["b-1", "b-2"])
+    check(main.count_ops(ops) == {"shared_set": 1, "shared_criterion": 2}, f"operations : {main.count_ops(ops)}")
+    shared_set = ops[0].shared_set_operation.create
+    check(shared_set.resource_name == f"customers/{CID}/sharedSets/-1", "ID temporaire")
+    check(shared_set.type_.name == "BRANDS" and shared_set.name == "Marque - LBC", "type BRANDS")
+    for op, brand in zip(ops[1:], ["b-1", "b-2"]):
+        crit = op.shared_criterion_operation.create
+        check(crit.shared_set == shared_set.resource_name and crit.brand.entity_id == brand, "BrandInfo")
+        check(crit._pb.WhichOneof("criterion") == "brand", "critere de type brand")
+    request = main.build_mutate_request(client, CID, ops, dry_run=True)
+    check(request.validate_only and len(request.mutate_operations) == 3, "requete atomique validate_only")
+
+    rn = f"customers/{CID}/sharedSets/555"
+    op = main._build_brand_exclusion_op(client, CID, "1000000002", rn)
+    crit = op.create
+    check(crit.campaign == f"customers/{CID}/campaigns/1000000002", "campagne")
+    check(crit.negative is True and crit.brand_list.shared_set == rn, "exclusion BrandListInfo")
+    check(crit._pb.WhichOneof("criterion") == "brand_list", "critere brand_list")
+    request = client.get_type("MutateCampaignCriteriaRequest")
+    request.operations.append(op)
+
+    check(main._shared_set_id("555") == "555" and main._shared_set_id(rn) == "555", "ID de liste")
+    for bad in ("", "abc", "customers/1/campaigns/2"):
+        try:
+            main._shared_set_id(bad)
+        except main.SpecError:
+            continue
+        raise AssertionError(f"shared_set invalide accepte : {bad!r}")
+    check(main._clean_brand_entity_ids(["a", " a ", "b"]) == ["a", "b"], "IDs de marque dedoublonnes")
+
+
 def test_url_expansion_ops(client) -> None:
     current = [
         {"asset_automation_type": "TEXT_ASSET_AUTOMATION", "asset_automation_status": "OPTED_OUT"},
@@ -1005,7 +1190,12 @@ def fake_run_query(customer_id: str, query: str, limit: int = 200) -> list[dict]
 
 OFFLINE_JOB_METHODS = (
     "create_offline_user_data_job", "add_offline_user_data_job_operations", "run_offline_user_data_job",
+    "suggest_brands",
 )
+# Marques renvoyees par la doublure de BrandSuggestionService.suggest_brands.
+SUGGESTED_BRANDS: list[dict] = []
+# Exceptions a lever par la prochaine methode mutate* (consommees dans l'ordre).
+MUTATE_FAILURES: list = []
 # Statuts d'erreur partielle a renvoyer par add_offline_user_data_job_operations
 # (consommes dans l'ordre ; vide = aucune erreur).
 PARTIAL_FAILURES: list = []
@@ -1024,12 +1214,23 @@ class RecordingService:
 
         def _mutate(request=None, **kwargs):
             self._log.append((self._name, attr, request))
+            if MUTATE_FAILURES and attr.startswith("mutate"):
+                raise MUTATE_FAILURES.pop(0)
             if attr == "create_offline_user_data_job":
                 return SimpleNamespace(resource_name=f"customers/{CID}/offlineUserDataJobs/555")
             if attr == "add_offline_user_data_job_operations":
                 response = self._client.get_type("AddOfflineUserDataJobOperationsResponse")
                 if PARTIAL_FAILURES:
                     response.partial_failure_error = PARTIAL_FAILURES.pop(0)
+                return response
+            if attr == "suggest_brands":
+                response = self._client.get_type("SuggestBrandsResponse")
+                for b in SUGGESTED_BRANDS:
+                    suggestion = self._client.get_type("BrandSuggestion")
+                    suggestion.id, suggestion.name = b["id"], b["name"]
+                    suggestion.urls.extend(b["urls"])
+                    suggestion.state = getattr(self._client.enums.BrandStateEnum, b["state"])
+                    response.brands.append(suggestion)
                 return response
             if attr == "run_offline_user_data_job":
                 return SimpleNamespace(operation=SimpleNamespace(name=f"customers/{CID}/operations/abc"))
@@ -1045,6 +1246,11 @@ class RecordingService:
                         response.mutate_operation_responses.append(result)
                 return response
             n = 0 if request.validate_only else len(request.operations)
+            if attr == "mutate_campaign_criteria":
+                return SimpleNamespace(results=[
+                    SimpleNamespace(resource_name=f"customers/{CID}/campaignCriteria/{op.create.campaign.rsplit('/', 1)[-1]}~{700 + i}")
+                    for i, op in enumerate(request.operations[:n])
+                ])
             return SimpleNamespace(
                 results=[SimpleNamespace(resource_name=f"customers/{CID}/{self._name}/{i}") for i in range(n)]
             )
@@ -1340,6 +1546,293 @@ def test_tools_end_to_end(default_client) -> None:
     check(QUERY_CIDS and set(QUERY_CIDS) == {CID}, f"comptes interroges : {set(QUERY_CIDS)}")
 
 
+PMAX_ID = "1000000002"
+SEARCH_ID = "1000000003"
+VIDEO_ID = "1000000004"
+BRAND_SET_RN = f"customers/{CID}/sharedSets/555"
+# Etat simule, modifiable par les tests : listes de marques liees a la PMax
+# [(resource name, negative)], noms deja pris, campagne App dependante ou non.
+BRAND_STATE: dict = {"attached": [], "existing_names": []}
+APP_STATE: dict = {"campaign": APP_CAMPAIGN, "config_level": None}
+
+
+def _gaql_quote(text: str) -> str:
+    return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def account_run_query(customer_id: str, query: str, limit: int = 200) -> list[dict]:
+    """run_query simule pour les objectifs du compte et les marques."""
+    q = " ".join(query.split())
+    QUERY_LOG.append(q)
+    if "IN ()" in q:  # Google : PROHIBITED_EMPTY_LIST_IN_CONDITION
+        raise AssertionError(f"liste vide dans IN : {q}")
+    if "FROM customer_conversion_goal" in q:
+        return [{"customer_conversion_goal": dict(g)} for g in ACCOUNT_GOALS]
+    if "FROM conversion_goal_campaign_config" in q:
+        # La campagne App n'a pas de ligne ici (comme dans un vrai compte).
+        return [
+            {"campaign": {"id": SEARCH_ID, "name": "Recherche - marque", "status": "ENABLED",
+                          "advertising_channel_type": "SEARCH", "bidding_strategy_type": "MAXIMIZE_CONVERSION_VALUE"},
+             "conversion_goal_campaign_config": {"goal_config_level": "CUSTOMER"}},
+            {"campaign": {"id": PMAX_ID, "name": "PMax - boutique", "status": "ENABLED",
+                          "advertising_channel_type": "PERFORMANCE_MAX", "bidding_strategy_type": "MAXIMIZE_CONVERSION_VALUE"},
+             "conversion_goal_campaign_config": {"goal_config_level": "CAMPAIGN"}},
+            {"campaign": {"id": VIDEO_ID, "name": "Video", "status": "ENABLED",
+                          "advertising_channel_type": "VIDEO", "bidding_strategy_type": "TARGET_CPM"},
+             "conversion_goal_campaign_config": {"goal_config_level": "CUSTOMER"}},
+        ] + ([{"campaign": {"id": APP_ID, "name": "App - installations", "status": "ENABLED",
+                            "advertising_channel_type": "MULTI_CHANNEL", "bidding_strategy_type": "TARGET_CPA"},
+               "conversion_goal_campaign_config": {"goal_config_level": APP_STATE["config_level"]}}]
+             if APP_STATE["config_level"] else [])
+    if "advertising_channel_type = 'MULTI_CHANNEL'" in q:
+        return [{"campaign": APP_STATE["campaign"]}]
+    if "FROM conversion_action WHERE conversion_action.resource_name IN" in q:
+        return [{"conversion_action": dict(a, resource_name=rn)} for rn, a in APP_ACTIONS.items() if f"'{rn}'" in q]
+    if "FROM shared_set WHERE shared_set.type = 'BRANDS' AND shared_set.name" in q:
+        return [{"shared_set": {"id": "555", "name": n, "status": "ENABLED"}}
+                for n in BRAND_STATE["existing_names"] if _gaql_quote(n) in q]
+    if "FROM shared_set WHERE shared_set.id = 555" in q:
+        return [{"shared_set": {"id": "555", "name": "Marque", "type_": "BRANDS", "status": "ENABLED", "member_count": "1"}}]
+    if "FROM shared_set WHERE shared_set.id = 556" in q:
+        return [{"shared_set": {"id": "556", "name": "Negatifs", "type_": "NEGATIVE_KEYWORDS", "status": "ENABLED"}}]
+    if "FROM shared_set WHERE shared_set.id = 557" in q:
+        return [{"shared_set": {"id": "557", "name": "Ancienne", "type_": "BRANDS", "status": "REMOVED"}}]
+    if "FROM shared_criterion WHERE shared_set.id = 555" in q:
+        return [{"shared_criterion": {"brand": {"entity_id": "b-1", "display_name": "Marque test", "status": "ENABLED"}}}]
+    if f"FROM campaign_criterion WHERE campaign.id = {PMAX_ID}" in q and "BRAND_LIST" in q:
+        return [{"campaign_criterion": {"criterion_id": "9", "negative": neg, "brand_list": {"shared_set": rn}}}
+                for rn, neg in BRAND_STATE["attached"]]
+    if f"FROM campaign WHERE campaign.id = {PMAX_ID}" in q:
+        return [{"campaign": {"id": PMAX_ID, "name": "PMax - boutique", "status": "ENABLED",
+                              "advertising_channel_type": "PERFORMANCE_MAX"}}]
+    if f"FROM campaign WHERE campaign.id = {SEARCH_ID}" in q:
+        return [{"campaign": {"id": SEARCH_ID, "name": "Recherche - marque", "status": "ENABLED",
+                              "advertising_channel_type": "SEARCH"}}]
+    return []
+
+
+def make_google_ads_exception(client, *op_indexes: int):
+    """GoogleAdsException hors ligne : une erreur sur operations[i].biddable par index."""
+    from google.ads.googleads.errors import GoogleAdsException
+
+    failure = client.get_type("GoogleAdsFailure")
+    for op_index in op_indexes:
+        error = client.get_type("GoogleAdsError")
+        error.message = f"Objectif {op_index} non modifiable."
+        error.error_code.field_error = client.get_type("FieldErrorEnum").FieldError.IMMUTABLE_FIELD
+        for name, index in (("operations", op_index), ("update", None), ("biddable", None)):
+            element = type(error.location).FieldPathElement()
+            element.field_name = name
+            if index is not None:
+                element.index = index
+            error.location.field_path_elements.append(element)
+        failure.errors.append(error)
+    return GoogleAdsException(None, None, failure, "req-test")
+
+
+def test_goal_and_brand_tools_end_to_end(default_client) -> None:
+    client = RecordingClient(default_client)
+    main.get_client = lambda: client
+    main.run_query = account_run_query
+
+    def call(tool, *args, **kwargs) -> dict:
+        return json.loads(tool(*args, **kwargs))
+
+    def last_queries(fragment: str) -> list[str]:
+        return [q for q in QUERY_LOG if fragment in q]
+
+    # --- set_customer_conversion_goals : dry_run par defaut, plan de l'etape 1
+    client.log.clear()
+    QUERY_LOG.clear()
+    res = call(main.set_customer_conversion_goals, PLAN_GOALS)
+    check(res.get("dry_run") is True and res.get("valid") is True, f"dry run par defaut : {res}")
+    check(res["after_biddable"] == ["PURCHASE/WEBSITE"], f"apres : {res['after_biddable']}")
+    check(len(res["before_biddable"]) == 10 and len(res["changes"]) == 9, "avant / changements")
+    check(res["unchanged_requested"] == len(PLAN_GOALS) - 9, f"inchanges : {res['unchanged_requested']}")
+    check([c["id"] for c in res["campaigns_following_account_goals"]] == [SEARCH_ID, VIDEO_ID], "campagnes heritieres")
+    check([c["id"] for c in res["campaigns_with_own_goals"]] == [PMAX_ID], "PMax a ses propres objectifs")
+    app = res["app_campaigns"][0]
+    check(app["id"] == APP_ID and app["depends_on_account_goals"] is False and res["warnings"] == [], f"App : {app}")
+    check(any("independante" in n for n in res["notices"]), f"avis App : {res['notices']}")
+    check([(sv, m) for sv, m, _ in client.log] == [("CustomerConversionGoalService", "mutate_customer_conversion_goals")], f"requetes : {client.log}")
+    request = client.log[0][2]
+    check(request.validate_only and len(request.operations) == 9, "9 operations en validate_only")
+    check(all(op.update.biddable is False for op in request.operations), "toutes en secondaire")
+    # Filtres GAQL : campagnes supprimees exclues.
+    check(all("campaign.status != 'REMOVED'" in q for q in last_queries("FROM conversion_goal_campaign_config")), "config : REMOVED exclu")
+    check(all("campaign.status != 'REMOVED'" in q for q in last_queries("'MULTI_CHANNEL'")), "App : REMOVED exclu")
+    check(any(f"'{APP_ACTION_RN}'" in q for q in last_queries("FROM conversion_action")), "actions App lues")
+    # Doublons : comptes une seule fois.
+    res = call(main.set_customer_conversion_goals, [
+        {"category": "ADD_TO_CART", "origin": "WEBSITE", "biddable": False},
+        {"category": "add_to_cart", "origin": "website", "biddable": "false"},
+        {"category": "PURCHASE", "origin": "WEBSITE", "biddable": True},
+    ])
+    check(len(res["changes"]) == 1 and res["unchanged_requested"] == 1, f"doublons : {res['unchanged_requested']}")
+    # Rien a changer : aucun appel a l'API.
+    client.log.clear()
+    res = call(main.set_customer_conversion_goals, [{"category": "PURCHASE", "origin": "WEBSITE", "biddable": True}], dry_run=False)
+    check(res["updated_goals"] == 0 and not client.log, f"aucun changement : {res}")
+    # Application reelle, plusieurs changements dans les deux sens.
+    client.log.clear()
+    res = call(main.set_customer_conversion_goals, [
+        {"category": "ADD_TO_CART", "origin": "WEBSITE", "biddable": False},
+        {"category": "PAGE_VIEW", "origin": "WEBSITE", "biddable": True},
+        {"category": "DEFAULT", "origin": "WEBSITE", "biddable": False},
+    ], dry_run=False)
+    check(res["updated_goals"] == 3 and not client.log[-1][2].validate_only, f"application reelle : {res}")
+    check([op.update.biddable for op in client.log[-1][2].operations] == [False, True, False], "valeurs envoyees")
+    # Campagne App independante : couper DOWNLOAD/APP au compte est permis.
+    kill_app = [{"category": "DOWNLOAD", "origin": "APP", "biddable": False}]
+    res = call(main.set_customer_conversion_goals, kill_app, dry_run=False)
+    check(res["updated_goals"] == 1 and res["warnings"] == [], f"App independante non bloquee : {res}")
+    # Campagne App dependante (aucune action choisie) : signalee, heritiere,
+    # refusee en reel sans allow_app_goal_change.
+    APP_STATE["campaign"] = dict(APP_CAMPAIGN, selective_optimization={})
+    try:
+        QUERY_LOG.clear()
+        res = call(main.set_customer_conversion_goals, kill_app)
+        check(not last_queries("FROM conversion_action"), "aucune action choisie : pas de requete conversion_action")
+        check(res["valid"] is True and len(res["warnings"]) == 1 and APP_ID in res["warnings"][0], f"alerte App dependante : {res['warnings']}")
+        check(APP_ID in [c["id"] for c in res["campaigns_following_account_goals"]], "App dependante listee parmi les heritieres")
+        check(any("depend des objectifs du compte" in n for n in res["notices"]), "dependance dans notices")
+        client.log.clear()
+        res = call(main.set_customer_conversion_goals, kill_app, dry_run=False)
+        check("refuse" in res["error"]["message"] and not client.log, f"refus App dependante : {res}")
+        res = call(main.set_customer_conversion_goals, kill_app, dry_run=False, allow_app_goal_change=True)
+        check(res["updated_goals"] == 1 and not client.log[-1][2].validate_only, f"App force : {res}")
+    finally:
+        APP_STATE["campaign"] = APP_CAMPAIGN
+    # Campagne App au niveau CUSTOMER (ligne de config) malgre ses actions choisies.
+    APP_STATE["config_level"] = "CUSTOMER"
+    try:
+        res = call(main.set_customer_conversion_goals, kill_app)
+        check(len(res["warnings"]) == 1 and APP_ID in res["warnings"][0], f"App CUSTOMER : {res['warnings']}")
+        ids = [c["id"] for c in res["campaigns_following_account_goals"]]
+        check(ids.count(APP_ID) == 1 and APP_ID not in [c["id"] for c in res["campaigns_with_own_goals"]], f"App CUSTOMER listee une fois : {ids}")
+        check(not any("aucune campagne App" in n and "DOWNLOAD/APP" in n for n in res["notices"]), "App pas comptee comme heritiere non-App")
+        client.log.clear()
+        res = call(main.set_customer_conversion_goals, kill_app, dry_run=False)
+        check("refuse" in res["error"]["message"] and not client.log, f"refus App CUSTOMER : {res}")
+    finally:
+        APP_STATE["config_level"] = None
+    res = call(main.set_customer_conversion_goals, [{"category": "PURCHASE", "origin": "APP", "biddable": True}])
+    check("n'existe pas" in res["error"], f"objectif inconnu : {res}")
+    all_off = [dict(g, biddable=False) for g in ACCOUNT_GOALS]
+    res = call(main.set_customer_conversion_goals, all_off)
+    check(any("Aucun objectif du compte" in w for w in res["warnings"]), "alerte : plus rien de biddable")
+    # Cette alerte n'est pas une alerte App : elle ne bloque pas le changement reel.
+    client.log.clear()
+    res = call(main.set_customer_conversion_goals, all_off, dry_run=False)
+    check("error" not in res and res["updated_goals"] == len(res["changes"]) and not client.log[-1][2].validate_only, f"all_off reel non bloque : {res}")
+    # Refus de Google : l'apercu est garde et chaque objectif fautif est nomme.
+    MUTATE_FAILURES.append(make_google_ads_exception(default_client, 1, 4))
+    res = call(main.set_customer_conversion_goals, PLAN_GOALS)
+    err = res["error"]
+    check(err["after_biddable"] == ["PURCHASE/WEBSITE"] and err["request_id"] == "req-test", f"apercu garde : {err}")
+    goal_at = lambda i: f"{err['changes'][i]['category']}/{err['changes'][i]['origin']}"
+    check([r["goal"] for r in err["rejected"]] == [goal_at(1), goal_at(4)], f"objectifs fautifs : {err['rejected']}")
+    check(err["rejected"][0]["message"] == "Objectif 1 non modifiable." and "IMMUTABLE_FIELD" in err["rejected"][0]["code"], f"raison et code : {err['rejected'][0]}")
+    check(not MUTATE_FAILURES, "erreur consommee")
+
+    # --- suggest_brands
+    SUGGESTED_BRANDS[:] = [
+        {"id": "b-1", "name": "Marque test", "urls": ["marque.example"], "state": "ENABLED"},
+        {"id": "b-old", "name": "Marque test", "urls": [], "state": "APPROVED"},
+        {"id": "b-own", "name": "Marque test", "urls": [], "state": "UNVERIFIED"},
+        {"id": "b-dep", "name": "Marque test", "urls": [], "state": "DEPRECATED"},
+        {"id": "b-can", "name": "Marque test", "urls": [], "state": "CANCELLED"},
+        {"id": "b-rej", "name": "Marque test", "urls": [], "state": "REJECTED"},
+    ]
+    client.log.clear()
+    res = call(main.suggest_brands, "marque", selected_brand_ids=[" x-1 ", " ", ""])
+    check([b["usable"] for b in res["brands"]] == [True, False, True, False, False, False], f"usable par etat : {res['brands']}")
+    check(res["brands"][0] == {"id": "b-1", "name": "Marque test", "urls": ["marque.example"], "state": "ENABLED", "usable": True}, f"suggest_brands : {res}")
+    check(res["brands"][1]["usable"] is False and "APPROVED = ancien id" in res["note"], "APPROVED non utilisable")
+    sv, m, request = client.log[-1]
+    check((sv, m) == ("BrandSuggestionService", "suggest_brands") and request.brand_prefix == "marque", "requete SuggestBrands")
+    check(list(request.selected_brands) == ["x-1"] and request.customer_id == CID, "marques deja choisies + compte")
+    SUGGESTED_BRANDS.clear()
+    res = call(main.suggest_brands, "zzz inconnue")
+    check(res["brand_count"] == 0 and "Plan B" in res["note"], f"aucune marque : {res}")
+    check("prefix" in call(main.suggest_brands, "  ")["error"], "prefix vide refuse")
+
+    # --- create_brand_list
+    client.log.clear()
+    QUERY_LOG.clear()
+    res = call(main.create_brand_list, "Marque", ["b-1"])
+    check(res.get("dry_run") is True and res["operations"] == {"shared_set": 1, "shared_criterion": 1}, f"liste dry run : {res}")
+    sv, m, request = client.log[-1]
+    check((sv, m) == ("GoogleAdsService", "mutate") and request.validate_only, "requete atomique validate_only")
+    check(all("shared_set.status = 'ENABLED'" in q for q in last_queries("shared_set.name")), "doublon : listes actives seulement")
+    res = call(main.create_brand_list, "Marque", ["b-1"], dry_run=False)
+    check(res["shared_set_id"] == "101" and res["brands_added"] == 1, f"liste creee : {res}")
+    # Nom avec apostrophe : echappe dans la requete GAQL, doublon detecte.
+    BRAND_STATE["existing_names"] = ["Marque", "L'Atelier"]
+    try:
+        client.log.clear()
+        res = call(main.create_brand_list, "Marque", ["b-1"])
+        check(res["error"]["shared_set_id"] == "555" and not client.log, f"nom deja pris : {res}")
+        res = call(main.create_brand_list, "L'Atelier", ["b-1"])
+        check(res["error"]["shared_set_id"] == "555" and not client.log, f"apostrophe echappee : {res}")
+        check(any("shared_set.name = 'L\\'Atelier'" in q for q in QUERY_LOG), "echappement GAQL")
+    finally:
+        BRAND_STATE["existing_names"] = []
+    check("brand_entity_ids" in call(main.create_brand_list, "X", [])["error"], "liste vide refusee")
+    # Nom finissant par un antislash : double dans la requete GAQL.
+    QUERY_LOG.clear()
+    res = call(main.create_brand_list, "Marque \\", ["b-1"])
+    check(res.get("dry_run") is True, f"antislash accepte : {res}")
+    check(any("shared_set.name = 'Marque \\\\'" in q for q in QUERY_LOG), f"antislash echappe : {QUERY_LOG[-1:]}")
+    # Limite de longueur : 255 accepte, 256 refuse sans appel.
+    check(call(main.create_brand_list, "x" * 255, ["b-1"]).get("dry_run") is True, "255 caracteres acceptes")
+    client.log.clear()
+    check("255" in call(main.create_brand_list, "x" * 256, ["b-1"])["error"] and not client.log, "256 caracteres refuses")
+
+    # --- set_pmax_brand_exclusion
+    client.log.clear()
+    res = call(main.set_pmax_brand_exclusion, PMAX_ID, "555")
+    check(res.get("dry_run") is True and res["brand_lists_before"] == [], f"exclusion dry run : {res}")
+    check(res["brand_lists_after"][0]["shared_set"] == BRAND_SET_RN and res["brand_list"]["brands"][0]["display_name"] == "Marque test", "avant / apres")
+    sv, m, request = client.log[-1]
+    check((sv, m) == ("CampaignCriterionService", "mutate_campaign_criteria") and request.validate_only, "requete exclusion")
+    crit = request.operations[0].create
+    check(crit.negative and crit.brand_list.shared_set == BRAND_SET_RN, "critere negatif BrandListInfo")
+    check(any("campaign_criterion.status != 'REMOVED'" in q for q in last_queries("BRAND_LIST")), "criteres supprimes exclus")
+    res = call(main.set_pmax_brand_exclusion, PMAX_ID, BRAND_SET_RN, dry_run=False)
+    check(res["added"] and not client.log[-1][2].validate_only, f"exclusion reelle : {res}")
+    check(res["brand_lists_after"][-1]["criterion_id"] == "700", f"criterion_id extrait : {res['brand_lists_after']}")
+    BRAND_STATE["attached"] = [(BRAND_SET_RN, True)]
+    try:
+        client.log.clear()
+        res = call(main.set_pmax_brand_exclusion, PMAX_ID, "555", dry_run=False)
+        check(res["already_attached"] is True and not client.log, f"deja liee : {res}")
+        BRAND_STATE["attached"] = [(BRAND_SET_RN, False)]  # ciblage positif : pas une exclusion
+        res = call(main.set_pmax_brand_exclusion, PMAX_ID, "555")
+        check("already_attached" not in res and res["valid"] is True, f"liste positive != exclusion : {res}")
+        other_rn = f"customers/{CID}/sharedSets/999"
+        BRAND_STATE["attached"] = [(other_rn, True)]  # une autre liste deja exclue
+        client.log.clear()
+        res = call(main.set_pmax_brand_exclusion, PMAX_ID, "555", dry_run=False)
+        check("already_attached" not in res and res.get("added") and len(client.log) == 1, f"autre liste exclue : {res}")
+        check([b["shared_set"] for b in res["brand_lists_after"]] == [other_rn, BRAND_SET_RN], "avant + nouvelle liste")
+    finally:
+        BRAND_STATE["attached"] = []
+    res = call(main.set_pmax_brand_exclusion, SEARCH_ID, "555")
+    check("Performance Max" in res["error"]["message"], f"campagne non PMax refusee : {res}")
+    client.log.clear()
+    res = call(main.set_pmax_brand_exclusion, "1000000099", "555")
+    check("introuvable" in res["error"] and not client.log, f"campagne inconnue : {res}")
+    res = call(main.set_pmax_brand_exclusion, PMAX_ID, "556")
+    check("BRANDS" in res["error"]["message"], f"liste non BRANDS refusee : {res}")
+    client.log.clear()
+    res = call(main.set_pmax_brand_exclusion, PMAX_ID, "557")
+    check("active" in res["error"]["message"] and not client.log, f"liste supprimee refusee : {res}")
+    res = call(main.set_pmax_brand_exclusion, PMAX_ID, "999")
+    check("introuvable" in res["error"], f"liste absente : {res}")
+    check("shared_set invalide" in call(main.set_pmax_brand_exclusion, PMAX_ID, "abc")["error"], "shared_set invalide")
+
+
 def test_tools_registered() -> None:
     tools = asyncio.run(main.mcp.list_all_tools())
     by_name = {t.name: t for t in tools}
@@ -1350,6 +1843,8 @@ def test_tools_registered() -> None:
         "add_campaign_assets",
         "list_user_lists", "get_customer_match_status", "create_customer_match_list",
         "upload_customer_match_members",
+        "set_customer_conversion_goals", "suggest_brands", "create_brand_list",
+        "set_pmax_brand_exclusion",
     ]
     for name in expected:
         check(name in by_name, f"outil non enregistre : {name}")
@@ -1367,9 +1862,49 @@ def test_tools_registered() -> None:
     check("user_list_id" in status_props and "job_resource_name" in status_props, "parametres du statut")
     check(by_name["create_pmax_campaign"].inputSchema["properties"]["spec"]["type"] == "object", "spec PMax: object")
     check("clone_from_campaign_id" in by_name["create_pmax_campaign"].description, "clonage documente")
-    check(len(tools) == 9 + 10 + 4, f"{len(tools)} outils (9 + 10 + 4 Customer Match attendus)")
+    check(len(tools) == 9 + 10 + 4 + 4, f"{len(tools)} outils (9 + 10 + 4 Customer Match + 4 objectifs/marques attendus)")
     check(main.READ_TOOL_NAMES | main.WRITE_TOOL_NAMES == set(by_name), "chaque outil est classe")
-    check(len(main.READ_TOOL_NAMES) == 10 and len(main.WRITE_TOOL_NAMES) == 13, "10 lectures, 13 ecritures")
+    check(len(main.READ_TOOL_NAMES) == 11 and len(main.WRITE_TOOL_NAMES) == 16, "11 lectures, 16 ecritures")
+    for name in ("set_customer_conversion_goals", "create_brand_list", "set_pmax_brand_exclusion"):
+        check(by_name[name].inputSchema["properties"]["dry_run"]["default"] is True, f"dry_run=true par defaut : {name}")
+    # Journal : dry_run effectif (defaut de l'outil quand l'argument manque).
+    check(main.mcp.effective_dry_run("create_brand_list", {}) is True, "defaut true journalise en dry run")
+    check(main.mcp.effective_dry_run("create_brand_list", {"dry_run": False}) is False, "dry_run=false explicite")
+    check(main.mcp.effective_dry_run("set_campaign_status", {}) is False, "defaut false des anciens outils")
+    check(main.mcp.effective_dry_run("set_campaign_status", {"dry_run": True}) is True, "dry_run=true explicite")
+    for text, expected in (("false", False), ("0", False), ("true", True), ("1", True)):
+        check(main.mcp.effective_dry_run("create_brand_list", {"dry_run": text}) is expected, f"dry_run texte {text!r}")
+    check(main.mcp.effective_dry_run("outil_inconnu", {}) is False, "outil inconnu")
+    # Ligne de journal reellement emise par call_tool (outil non execute).
+    logged, saved = [], (main.log, main.can_write, main.FastMCP.call_tool)
+
+    async def _no_exec(self, name, arguments):
+        return None
+
+    main.log, main.can_write, main.FastMCP.call_tool = logged.append, (lambda user: True), _no_exec
+    try:
+        for name, args, dry in (
+            ("create_brand_list", {}, True),
+            ("create_brand_list", {"dry_run": "false"}, False),
+            ("set_campaign_status", {}, False),
+            ("set_campaign_status", {"dry_run": True}, True),
+            ("get_campaigns", {}, False),
+        ):
+            logged.clear()
+            asyncio.run(main.mcp.call_tool(name, args))
+            check(len(logged) == 1 and ("(dry run)" in logged[0]) is dry, f"journal {name} {args} : {logged}")
+    finally:
+        main.log, main.can_write, main.FastMCP.call_tool = saved
+    # Instructions : chaque outil d'ecriture y est nomme ; defauts dry_run explicites.
+    missing = sorted(n for n in main.WRITE_TOOL_NAMES if n not in main.mcp.instructions)
+    check(not missing, f"outils d'ecriture absents des instructions : {missing}")
+    m = re.search(r"Write tools \(([^)]*)\)", main.mcp.instructions)
+    listed = {n.strip() for n in m.group(1).split(",")} if m else set()
+    check(listed == main.WRITE_TOOL_NAMES, f"liste 'Write tools (...)' : {sorted(listed ^ main.WRITE_TOOL_NAMES)}")
+    check("set_customer_conversion_goals, create_brand_list and set_pmax_brand_exclusion default to dry_run=true" in main.mcp.instructions, "trois outils dry_run=true par defaut")
+    check("(including set_campaign_conversion_goals and add_negative_keywords) applies the change immediately" in main.mcp.instructions, "autres outils : application immediate")
+    goals_schema = by_name["set_customer_conversion_goals"].inputSchema["properties"]["goals"]
+    check(goals_schema["type"] == "array" and goals_schema["items"]["type"] == "object", f"goals: array d'objets ({goals_schema})")
     for name, tool in by_name.items():
         is_write = name in main.WRITE_TOOL_NAMES
         check(is_write == name.startswith(("set_", "add_", "create_", "upload_")), f"classement : {name}")
@@ -1480,7 +2015,8 @@ def main_() -> None:
         for test in (
             test_search_campaign_ops, test_pmax_campaign_ops, test_ad_group_and_asset_ops,
             test_search_theme_ops, test_target_roas_ops, test_conversion_goal_ops,
-            test_url_expansion_ops, test_customer_match_ops,
+            test_url_expansion_ops, test_customer_match_ops, test_customer_goal_ops,
+            test_brand_ops,
         ):
             test(client)
             print(f"OK  {test.__name__:32s} API {label}")
@@ -1497,6 +2033,8 @@ def main_() -> None:
         print(f"OK  {test.__name__:32s}")
     test_tools_end_to_end(make_client(None))
     print(f"OK  {test_tools_end_to_end.__name__:32s} API defaut ({_DEFAULT_VERSION})")
+    test_goal_and_brand_tools_end_to_end(make_client(None))
+    print(f"OK  {test_goal_and_brand_tools_end_to_end.__name__:32s} API defaut ({_DEFAULT_VERSION})")
     print(f"\n{CHECKS} verifications reussies, aucune requete reseau.")
 
 
